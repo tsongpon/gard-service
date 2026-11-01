@@ -105,6 +105,36 @@ class DeviceCommandConsumerTest extends AbstractIntegrationTest {
     }
 
     @Test
+    void sendsMalformedCommandToDeadLetterTopicAndContinuesProcessing() throws Exception {
+        String malformed = "{\"imei\":";
+        kafkaTemplate.send(DeviceCommandConsumer.TOPIC, malformed).get(5, TimeUnit.SECONDS);
+
+        AtomicReference<String> received = new AtomicReference<>();
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(
+                Map.of(
+                        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers(),
+                        ConsumerConfig.GROUP_ID_CONFIG, "device-dlt-test-" + UUID.randomUUID(),
+                        ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"),
+                new StringDeserializer(), new StringDeserializer())) {
+            consumer.subscribe(List.of(KafkaTopics.DEVICE_COMMANDS_DLT));
+
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                consumer.poll(Duration.ofMillis(500)).forEach(record -> received.set(record.value()));
+                assertThat(received.get()).isEqualTo(malformed);
+            });
+        }
+
+        kafkaTemplate.send(DeviceCommandConsumer.TOPIC, "{\"imei\":\"356938035643813\",\"appReferenceId\":\"ref-e\"}")
+                .get(5, TimeUnit.SECONDS);
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            var device = repository.findByImei("356938035643813");
+            assertThat(device).isPresent();
+            assertThat(device.get().getAppReferenceId()).isEqualTo("ref-e");
+        });
+    }
+
+    @Test
     void rejectsRegisterCommandForAlreadyRegisteredImei() throws Exception {
         kafkaTemplate.send(DeviceCommandConsumer.TOPIC,
                 "{\"imei\":\"356938035643811\",\"appReferenceId\":\"ref-c\"}").get(5, TimeUnit.SECONDS);

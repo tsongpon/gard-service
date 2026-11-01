@@ -7,6 +7,7 @@ import com.gard.service.DeviceService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
 
 import tools.jackson.databind.ObjectMapper;
@@ -27,9 +28,10 @@ public class DeviceCommandConsumer {
     }
 
     @KafkaListener(topics = TOPIC)
-    public void consumeRegisterDeviceCommand(String message) {
+    public void consumeRegisterDeviceCommand(String message, Acknowledgment acknowledgment) {
         DeviceRegisterRequest request = objectMapper.readValue(message, DeviceRegisterRequest.class);
         log.info("Received device register command for imei {}", request.imei());
         service.register(request);
+        acknowledgment.acknowledge();
     }
 }
