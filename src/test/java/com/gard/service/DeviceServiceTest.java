@@ -26,6 +26,7 @@ import tools.jackson.databind.ObjectMapper;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -56,8 +57,9 @@ class DeviceServiceTest {
             action.accept(null);
             return null;
         }).when(transactionTemplate).executeWithoutResult(any());
+        when(deviceRepository.tryClaim(any(), any(), any(), any())).thenReturn(1);
         service = new DeviceService(deviceRepository, oGradRepository, outboxRepository, transactionTemplate,
-                new ObjectMapper(), 1, 1, 5);
+                new ObjectMapper(), 1, 1, 5, 180);
     }
 
     @Test
@@ -187,7 +189,7 @@ class DeviceServiceTest {
     @Test
     void oGradStepFailureMarksDeviceFailedAndWritesErrorResponse() {
         Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        when(deviceRepository.findTop50ByStateOrderByIdAsc("enrolling")).thenReturn(List.of(device));
+        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
         when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
         doThrow(new IllegalStateException("connection refused")).when(oGradRepository).validateImei("111");
 
@@ -203,7 +205,7 @@ class DeviceServiceTest {
     @Test
     void successfulValidateAndUploadMarksDeviceUploaded() {
         Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        when(deviceRepository.findTop50ByStateOrderByIdAsc("enrolling")).thenReturn(List.of(device));
+        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
         when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
 
         service.processEnrolling();
@@ -219,14 +221,14 @@ class DeviceServiceTest {
 
     @Test
     void processEnrollingSkipsDeviceAlreadyTransitioned() {
-        Device device = new Device("ref-1", "111", null, "provisioning", "pending", LocalDateTime.now());
-        when(deviceRepository.findTop50ByStateOrderByIdAsc("enrolling")).thenReturn(List.of(device));
+        Device device = new Device("ref-1", "111", null, "activating", "pending", LocalDateTime.now());
+        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
         when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
 
         service.processEnrolling();
 
         verify(oGradRepository).validateImei("111");
-        assertThat(device.getState()).isEqualTo("provisioning");
+        assertThat(device.getState()).isEqualTo("activating");
         assertThat(device.getNextStatusCheckAt()).isNull();
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
@@ -235,7 +237,7 @@ class DeviceServiceTest {
     void optimisticLockFailureSkipsDeviceAndContinuesBatch() {
         Device first = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
         Device second = new Device("ref-2", "222", null, "enrolling", "pending", LocalDateTime.now());
-        when(deviceRepository.findTop50ByStateOrderByIdAsc("enrolling")).thenReturn(List.of(first, second));
+        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(first, second));
         when(deviceRepository.findById(any())).thenReturn(Optional.of(second));
         doAnswer(invocation -> {
             throw new OptimisticLockingFailureException("lost race");
@@ -252,17 +254,17 @@ class DeviceServiceTest {
     }
 
     @Test
-    void chooseStepSuccessMarksDeviceProvisioning() {
+    void chooseStepSuccessMarksDeviceActivating() {
         Device device = new Device("ref-1", "111", null, "uploaded", "pending", LocalDateTime.now());
-        when(deviceRepository.findTop50ByStateAndChooseNotBeforeLessThanEqualOrderByIdAsc(anyString(),
-                any(LocalDateTime.class))).thenReturn(List.of(device));
+        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
+                .thenReturn(List.of(device));
         when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
 
         service.processUploaded();
 
         verify(oGradRepository).choose("111");
         verify(oGradRepository, never()).validateImei("111");
-        assertThat(device.getState()).isEqualTo("provisioning");
+        assertThat(device.getState()).isEqualTo("activating");
         assertThat(device.getStatusDeadlineAt()).isNotNull();
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
@@ -270,8 +272,8 @@ class DeviceServiceTest {
     @Test
     void chooseStepFailureMarksDeviceFailedAndWritesErrorResponse() {
         Device device = new Device("ref-1", "111", null, "uploaded", "pending", LocalDateTime.now());
-        when(deviceRepository.findTop50ByStateAndChooseNotBeforeLessThanEqualOrderByIdAsc(anyString(),
-                any(LocalDateTime.class))).thenReturn(List.of(device));
+        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
+                .thenReturn(List.of(device));
         when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
         doThrow(new IllegalStateException("connection refused")).when(oGradRepository).choose("111");
 
@@ -284,15 +286,15 @@ class DeviceServiceTest {
 
     @Test
     void processUploadedSkipsDeviceAlreadyTransitioned() {
-        Device device = new Device("ref-1", "111", null, "provisioning", "pending", LocalDateTime.now());
-        when(deviceRepository.findTop50ByStateAndChooseNotBeforeLessThanEqualOrderByIdAsc(anyString(),
-                any(LocalDateTime.class))).thenReturn(List.of(device));
+        Device device = new Device("ref-1", "111", null, "activating", "pending", LocalDateTime.now());
+        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
+                .thenReturn(List.of(device));
         when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
 
         service.processUploaded();
 
         verify(oGradRepository).choose("111");
-        assertThat(device.getState()).isEqualTo("provisioning");
+        assertThat(device.getState()).isEqualTo("activating");
         assertThat(device.getNextStatusCheckAt()).isNull();
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
@@ -301,8 +303,8 @@ class DeviceServiceTest {
     void optimisticLockFailureDuringChooseSkipsDeviceAndContinuesBatch() {
         Device first = new Device("ref-1", "111", null, "uploaded", "pending", LocalDateTime.now());
         Device second = new Device("ref-2", "222", null, "uploaded", "pending", LocalDateTime.now());
-        when(deviceRepository.findTop50ByStateAndChooseNotBeforeLessThanEqualOrderByIdAsc(anyString(),
-                any(LocalDateTime.class))).thenReturn(List.of(first, second));
+        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
+                .thenReturn(List.of(first, second));
         when(deviceRepository.findById(any())).thenReturn(Optional.of(second));
         doAnswer(invocation -> {
             throw new OptimisticLockingFailureException("lost race");
@@ -315,7 +317,7 @@ class DeviceServiceTest {
         service.processUploaded();
 
         assertThat(first.getState()).isEqualTo("uploaded");
-        assertThat(second.getState()).isEqualTo("provisioning");
+        assertThat(second.getState()).isEqualTo("activating");
     }
 
     @Test
@@ -364,7 +366,7 @@ class DeviceServiceTest {
 
         service.pollStatus();
 
-        assertThat(device.getState()).isEqualTo("provisioning");
+        assertThat(device.getState()).isEqualTo("activating");
         assertThat(device.getNextStatusCheckAt()).isAfter(LocalDateTime.now());
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
@@ -380,7 +382,7 @@ class DeviceServiceTest {
 
         service.pollStatus();
 
-        assertThat(device.getState()).isEqualTo("provisioning");
+        assertThat(device.getState()).isEqualTo("activating");
         assertThat(device.getNextStatusCheckAt()).isAfter(LocalDateTime.now());
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
@@ -399,6 +401,77 @@ class DeviceServiceTest {
         assertThat(device.getState()).isEqualTo("failed");
         OutboxMessage saved = captureOutboxSave();
         assertThat(saved.getPayload()).contains("REGISTER_FAILED").contains("unavailable");
+    }
+
+    @Test
+    void unclaimedDeviceIsSkippedWithoutExternalCall() {
+        Device first = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
+        Device second = new Device("ref-2", "222", null, "enrolling", "pending", LocalDateTime.now());
+        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any()))
+                .thenReturn(List.of(first, second));
+        when(deviceRepository.findById(any())).thenReturn(Optional.of(second));
+        when(deviceRepository.tryClaim(any(), any(), any(), any())).thenReturn(0, 1);
+
+        service.processEnrolling();
+
+        verify(oGradRepository, never()).validateImei("111");
+        verify(oGradRepository).validateImei("222");
+        assertThat(first.getState()).isEqualTo("enrolling");
+        assertThat(second.getState()).isEqualTo("uploaded");
+    }
+
+    @Test
+    void successfulValidateAndUploadClearsProcessingLease() {
+        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
+        device.setProcessingUntil(LocalDateTime.now().plusMinutes(3));
+        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
+        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+
+        service.processEnrolling();
+
+        assertThat(device.getState()).isEqualTo("uploaded");
+        assertThat(device.getProcessingUntil()).isNull();
+    }
+
+    @Test
+    void oGradStepFailureClearsProcessingLease() {
+        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
+        device.setProcessingUntil(LocalDateTime.now().plusMinutes(3));
+        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
+        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+        doThrow(new IllegalStateException("connection refused")).when(oGradRepository).validateImei("111");
+
+        service.processEnrolling();
+
+        assertThat(device.getState()).isEqualTo("failed");
+        assertThat(device.getProcessingUntil()).isNull();
+    }
+
+    @Test
+    void chooseStepSuccessClearsProcessingLease() {
+        Device device = new Device("ref-1", "111", null, "uploaded", "pending", LocalDateTime.now());
+        device.setProcessingUntil(LocalDateTime.now().plusMinutes(3));
+        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
+                .thenReturn(List.of(device));
+        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+
+        service.processUploaded();
+
+        assertThat(device.getState()).isEqualTo("activating");
+        assertThat(device.getProcessingUntil()).isNull();
+    }
+
+    @Test
+    void registerRetryClearsStaleLeaseOnFailedDevice() {
+        Device failed = new Device("ref-old", "111", null, "failed", "pending", LocalDateTime.now());
+        failed.setProcessingUntil(LocalDateTime.now().plusMinutes(3));
+        when(deviceRepository.findByAppReferenceId("ref-new")).thenReturn(Optional.empty());
+        when(deviceRepository.findByImei("111")).thenReturn(Optional.of(failed));
+
+        service.register(new DeviceRegisterRequest("111", "ref-new"));
+
+        assertThat(failed.getState()).isEqualTo("enrolling");
+        assertThat(failed.getProcessingUntil()).isNull();
     }
 
     private OutboxMessage captureOutboxSave() {

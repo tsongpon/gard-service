@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -35,6 +36,8 @@ public class DeviceService {
 
     private static final String INITIAL_STATUS = "pending";
 
+    private static final int BATCH_SIZE = 50;
+
     private final DeviceRepository deviceRepository;
     private final OGradRepository oGradRepository;
     private final OutboxMessageRepository outboxRepository;
@@ -44,13 +47,15 @@ public class DeviceService {
     private final long chooseWaitSeconds;
     private final long pollIntervalSeconds;
     private final long maxWaitSeconds;
+    private final long processingLeaseSeconds;
 
     public DeviceService(DeviceRepository deviceRepository, OGradRepository oGradRepository,
             OutboxMessageRepository outboxRepository, TransactionTemplate transactionTemplate,
             ObjectMapper objectMapper,
             @Value("${ograd.choose.wait-seconds:60}") long chooseWaitSeconds,
             @Value("${ograd.status.poll-interval-seconds:10}") long pollIntervalSeconds,
-            @Value("${ograd.status.max-wait-seconds:300}") long maxWaitSeconds) {
+            @Value("${ograd.status.max-wait-seconds:300}") long maxWaitSeconds,
+            @Value("${device.processing.lease-seconds:180}") long processingLeaseSeconds) {
         this.deviceRepository = deviceRepository;
         this.oGradRepository = oGradRepository;
         this.outboxRepository = outboxRepository;
@@ -59,6 +64,7 @@ public class DeviceService {
         this.chooseWaitSeconds = chooseWaitSeconds;
         this.pollIntervalSeconds = pollIntervalSeconds;
         this.maxWaitSeconds = maxWaitSeconds;
+        this.processingLeaseSeconds = processingLeaseSeconds;
     }
 
     @Transactional
@@ -119,9 +125,24 @@ public class DeviceService {
         reject(appReferenceId, existing.getId(), imei, "imei already registered");
     }
 
+    private boolean claim(Device device, String state) {
+        LocalDateTime now = LocalDateTime.now();
+        int claimed = deviceRepository.tryClaim(device.getId(), state, now.plusSeconds(processingLeaseSeconds),
+                now);
+        if (claimed == 0) {
+            log.debug("Device {} already claimed by another worker, skipping", device.getId());
+            return false;
+        }
+        return true;
+    }
+
     public void processEnrolling() {
-        List<Device> enrollingDevices = deviceRepository.findTop50ByStateOrderByIdAsc("enrolling");
-        for (Device device : enrollingDevices) {
+        List<Device> claimableDevices = deviceRepository.findClaimableByState("enrolling", LocalDateTime.now(),
+                PageRequest.of(0, BATCH_SIZE));
+        for (Device device : claimableDevices) {
+            if (!claim(device, "enrolling")) {
+                continue;
+            }
             String failure = runValidateAndUpload(device);
             try {
                 transactionTemplate.executeWithoutResult(
@@ -162,9 +183,13 @@ public class DeviceService {
     }
 
     public void processUploaded() {
-        List<Device> uploadedDevices = deviceRepository
-                .findTop50ByStateAndChooseNotBeforeLessThanEqualOrderByIdAsc("uploaded", LocalDateTime.now());
+        LocalDateTime now = LocalDateTime.now();
+        List<Device> uploadedDevices = deviceRepository.findClaimableForChoose("uploaded", now, now,
+                PageRequest.of(0, BATCH_SIZE));
         for (Device device : uploadedDevices) {
+            if (!claim(device, "uploaded")) {
+                continue;
+            }
             String failure = runChoose(device);
             try {
                 transactionTemplate.executeWithoutResult(
@@ -205,7 +230,7 @@ public class DeviceService {
 
     public void pollStatus() {
         List<Device> due = deviceRepository
-                .findTop50ByStateAndNextStatusCheckAtLessThanEqualOrderByIdAsc("provisioning", LocalDateTime.now());
+                .findTop50ByStateAndNextStatusCheckAtLessThanEqualOrderByIdAsc("activating", LocalDateTime.now());
         for (Device device : due) {
             String deviceStatus = fetchStatus(device);
             try {
@@ -231,7 +256,7 @@ public class DeviceService {
 
     private void completeStatusPoll(String deviceId, String deviceStatus) {
         Device device = deviceRepository.findById(deviceId).orElse(null);
-        if (device == null || !"provisioning".equals(device.getState())) {
+        if (device == null || !"activating".equals(device.getState())) {
             return;
         }
         if ("normal".equals(deviceStatus)) {
