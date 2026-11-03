@@ -7,7 +7,6 @@ import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-/** Safety net for the Kafka-driven workflow: re-queues step events for devices that stopped moving. */
 @Component
 public class DeviceSweeperSchedule {
 

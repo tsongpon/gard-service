@@ -39,8 +39,7 @@ public class OutboxService {
                 throw new IllegalStateException("Interrupted while publishing outbox message " + message.getId(), e);
             }
             catch (ExecutionException | TimeoutException e) {
-                // Stop here rather than skip ahead: later rows may be for the same device, and publishing them
-                // first would deliver that device's events out of order.
+                // Skipping ahead could publish a later event for the same device first.
                 log.warn("Failed to publish outbox message {}, stopping batch and retrying next cycle: {}",
                         message.getId(), e.getMessage());
                 break;

@@ -18,10 +18,6 @@ public interface DeviceRepository extends JpaRepository<Device, String> {
 
     Optional<Device> findByAppReferenceId(String appReferenceId);
 
-    /**
-     * Devices in a non-final state that have not changed since {@code cutoff}, oldest first. Falls back to
-     * createdAt for rows written before updatedAt was always set.
-     */
     @Query("""
             select d from Device d
              where d.state in :states

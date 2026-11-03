@@ -64,8 +64,6 @@ class DeviceServiceTest {
                 objectMapper, 1, 1, 5, 600);
     }
 
-    // ---------------------------------------------------------------- register
-
     @Test
     void registerSavesNewDeviceAndQueuesEnrollStep() {
         when(deviceRepository.findByAppReferenceId("ref-1")).thenReturn(Optional.empty());
@@ -197,8 +195,6 @@ class DeviceServiceTest {
         assertThat(captureOutboxSave().getTopic()).isEqualTo(KafkaTopics.DEVICE_ENROLL);
     }
 
-    // ---------------------------------------------------------------- enroll step
-
     @Test
     void enrollSuccessMarksUploadedAndQueuesDelayedChoose() {
         Device device = stored(device("ref-1", "111", "enrolling"));
@@ -276,8 +272,6 @@ class DeviceServiceTest {
         verify(oGradRepository).upload("111");
     }
 
-    // ---------------------------------------------------------------- choose step
-
     @Test
     void chooseSuccessMarksActivatingAndQueuesStatusCheck() {
         Device device = stored(device("ref-1", "111", "uploaded"));
@@ -314,8 +308,6 @@ class DeviceServiceTest {
         verifyNoInteractions(oGradRepository);
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
-
-    // ---------------------------------------------------------------- status step
 
     @Test
     void normalStatusEnrollsDeviceAndWritesSuccessResponse() {
@@ -379,8 +371,6 @@ class DeviceServiceTest {
         assertThat(captureOutboxSave().getPayload()).contains("REGISTER_FAILED").contains("unavailable");
     }
 
-    // ---------------------------------------------------------------- sweeper
-
     @Test
     void sweeperRequeuesStepForEachStuckState() {
         Device enrolling = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now().minusHours(1));
@@ -411,8 +401,6 @@ class DeviceServiceTest {
 
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
-
-    // ---------------------------------------------------------------- helpers
 
     private static Device device(String reference, String imei, String state) {
         return new Device(reference, imei, null, state, "pending", LocalDateTime.now());

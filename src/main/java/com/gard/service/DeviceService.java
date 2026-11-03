@@ -30,17 +30,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import tools.jackson.databind.ObjectMapper;
 
-/**
- * Device registration state machine. Each step is triggered by a Kafka event (see
- * {@link com.gard.consumer.DeviceStepConsumer}), calls OGrad outside any transaction, then in one
- * transaction re-checks the device state, applies the transition and writes the next step event to the
- * outbox.
- *
- * <pre>
- * enrolling --validate+upload--> uploaded --(wait)--choose--> activating --poll status--> enrolled
- *     \__________________________________\_______________________________\_______________> failed
- * </pre>
- */
 @Service
 public class DeviceService {
 
@@ -88,8 +77,6 @@ public class DeviceService {
         this.maxWaitSeconds = maxWaitSeconds;
         this.stuckSeconds = stuckSeconds;
     }
-
-    // ---------------------------------------------------------------- register (device-commands)
 
     @Transactional
     public void register(DeviceRegisterRequest request) {
@@ -151,8 +138,6 @@ public class DeviceService {
         reject(appReferenceId, existing.getId(), imei, "imei already registered");
     }
 
-    // ---------------------------------------------------------------- enroll step (device-enroll)
-
     public void handleEnroll(DeviceStepEvent event) {
         Device device = loadInState(event, ENROLLING);
         if (device == null) {
@@ -185,8 +170,6 @@ public class DeviceService {
         }
     }
 
-    // ---------------------------------------------------------------- choose step (device-choose)
-
     public void handleChoose(DeviceStepEvent event) {
         Device device = loadInState(event, UPLOADED);
         if (device == null) {
@@ -217,8 +200,6 @@ public class DeviceService {
             return "OGrad choose step failed: " + e.getMessage();
         }
     }
-
-    // ---------------------------------------------------------------- status step (device-status-check)
 
     public void handleStatusCheck(DeviceStepEvent event) {
         Device device = loadInState(event, ACTIVATING);
@@ -262,13 +243,6 @@ public class DeviceService {
         enqueueStep(KafkaTopics.DEVICE_STATUS_CHECK, device, toInstant(nextCheck));
     }
 
-    // ---------------------------------------------------------------- safety net
-
-    /**
-     * Re-queues the step event for devices that have sat in a non-final state longer than
-     * {@code device.sweeper.stuck-seconds} (event dead-lettered, outbox row lost, or devices left in flight
-     * by the old scheduler-based version). Re-queuing is safe because every step re-checks the state.
-     */
     public void sweepStuckDevices() {
         LocalDateTime cutoff = LocalDateTime.now().minusSeconds(stuckSeconds);
         List<Device> stuck = deviceRepository.findStuck(IN_FLIGHT_STATES, cutoff,
@@ -302,9 +276,6 @@ public class DeviceService {
         return device.getUpdatedAt() != null ? device.getUpdatedAt() : device.getCreatedAt();
     }
 
-    // ---------------------------------------------------------------- helpers
-
-    /** Pre-check outside the transaction so stale or duplicate events skip the OGrad call entirely. */
     private Device loadInState(DeviceStepEvent event, String expectedState) {
         Device device = deviceRepository.findById(event.deviceId()).orElse(null);
         if (device == null || !expectedState.equals(device.getState())) {
@@ -315,11 +286,6 @@ public class DeviceService {
         return device;
     }
 
-    /**
-     * Runs {@code change} in a new transaction on a fresh copy of the device, only if it is still in
-     * {@code expectedState}. A concurrent update (optimistic lock) means another event already advanced the
-     * device, so it is logged and skipped.
-     */
     private void transition(String deviceId, String expectedState, Consumer<Device> change) {
         try {
             transactionTemplate.executeWithoutResult(transactionStatus -> {

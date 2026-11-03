@@ -9,10 +9,6 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.TopicBuilder;
 import org.springframework.kafka.core.KafkaAdmin;
 
-/**
- * Declares every topic the service uses so they exist before listeners start. Each DLT gets the same
- * partition count as its source topic, because the dead-letter recoverer keeps the original partition.
- */
 @Configuration
 public class KafkaTopicConfig {
 
@@ -33,6 +29,7 @@ public class KafkaTopicConfig {
                 topic(KafkaTopics.DEVICE_STATUS_CHECK + KafkaTopics.DLT_SUFFIX));
     }
 
+    // DLTs need as many partitions as their source: the recoverer keeps the original partition.
     private NewTopic topic(String name) {
         return TopicBuilder.name(name).partitions(partitions).build();
     }

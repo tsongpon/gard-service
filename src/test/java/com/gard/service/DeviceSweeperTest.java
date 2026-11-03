@@ -13,10 +13,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-/**
- * A device left in flight with no step event (e.g. created by the old scheduler-based version, or its event
- * was dead-lettered) is picked up by the sweeper and driven to completion through Kafka.
- */
 class DeviceSweeperTest extends AbstractIntegrationTest {
 
     @Autowired

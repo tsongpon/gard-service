@@ -87,7 +87,6 @@ public class Device {
         this.updatedAt = LocalDateTime.now();
     }
 
-    /** Bumps updatedAt (and the version) so the sweeper does not pick the device again right away. */
     public void touch() {
         this.updatedAt = LocalDateTime.now();
     }

@@ -13,20 +13,9 @@ import org.springframework.stereotype.Component;
 
 import tools.jackson.databind.ObjectMapper;
 
-/**
- * One listener container per workflow step, each in its own consumer group so a slow or paused step never
- * rebalances the others. {@code max.poll.records=1} keeps a poll well within {@code max.poll.interval.ms}
- * even when an OGrad call runs through all its retries.
- *
- * <p>Delayed steps (choose, status check) rely on every event in a topic having the same delay, so events
- * in a partition are already in {@code dueAt} order: only the head record ever needs to wait. When it is not
- * due yet the listener {@code nack}s it, which pauses this container's partitions and re-delivers the same
- * record later without blocking the thread.
- */
 @Component
 public class DeviceStepConsumer {
 
-    /** Kept well below the default max.poll.interval.ms (5 min); a longer wait just nacks again. */
     static final Duration MAX_PAUSE = Duration.ofSeconds(30);
 
     private final DeviceService service;
@@ -66,7 +55,8 @@ public class DeviceStepConsumer {
         ack.acknowledge();
     }
 
-    /** @return true if the event is not due yet and was nacked for re-delivery */
+    // All events in a delay topic share one delay, so only the partition head ever waits. nack pauses the
+    // partition instead of blocking the thread; the cap keeps each pause under max.poll.interval.ms.
     static boolean deferUntilDue(DeviceStepEvent event, Acknowledgment ack) {
         if (event.dueAt() == null) {
             return false;
