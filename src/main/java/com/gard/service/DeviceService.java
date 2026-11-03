@@ -4,10 +4,12 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 import com.gard.dto.DeviceRegisterFailedResponse;
 import com.gard.dto.DeviceRegisterRequest;
 import com.gard.dto.DeviceRegisteredResponse;
+import com.gard.dto.DeviceStepEvent;
 import com.gard.entity.Device;
 import com.gard.entity.OutboxMessage;
 import com.gard.kafka.KafkaTopics;
@@ -32,11 +34,19 @@ public class DeviceService {
 
     private static final Logger log = LoggerFactory.getLogger(DeviceService.class);
 
-    private static final String INITIAL_STATE = "enrolling";
+    static final String ENROLLING = "enrolling";
+
+    static final String UPLOADED = "uploaded";
+
+    static final String ACTIVATING = "activating";
+
+    static final String FAILED = "failed";
 
     private static final String INITIAL_STATUS = "pending";
 
-    private static final int BATCH_SIZE = 50;
+    private static final List<String> IN_FLIGHT_STATES = List.of(ENROLLING, UPLOADED, ACTIVATING);
+
+    private static final int SWEEP_BATCH_SIZE = 50;
 
     private final DeviceRepository deviceRepository;
     private final OGradRepository oGradRepository;
@@ -47,7 +57,7 @@ public class DeviceService {
     private final long chooseWaitSeconds;
     private final long pollIntervalSeconds;
     private final long maxWaitSeconds;
-    private final long processingLeaseSeconds;
+    private final long stuckSeconds;
 
     public DeviceService(DeviceRepository deviceRepository, OGradRepository oGradRepository,
             OutboxMessageRepository outboxRepository, TransactionTemplate transactionTemplate,
@@ -55,7 +65,12 @@ public class DeviceService {
             @Value("${ograd.choose.wait-seconds:60}") long chooseWaitSeconds,
             @Value("${ograd.status.poll-interval-seconds:10}") long pollIntervalSeconds,
             @Value("${ograd.status.max-wait-seconds:300}") long maxWaitSeconds,
-            @Value("${device.processing.lease-seconds:180}") long processingLeaseSeconds) {
+            @Value("${device.sweeper.stuck-seconds:600}") long stuckSeconds) {
+        if (stuckSeconds <= Math.max(chooseWaitSeconds, pollIntervalSeconds)) {
+            throw new IllegalStateException("device.sweeper.stuck-seconds (" + stuckSeconds
+                    + ") must be greater than ograd.choose.wait-seconds (" + chooseWaitSeconds
+                    + ") and ograd.status.poll-interval-seconds (" + pollIntervalSeconds + ")");
+        }
         this.deviceRepository = deviceRepository;
         this.oGradRepository = oGradRepository;
         this.outboxRepository = outboxRepository;
@@ -64,7 +79,7 @@ public class DeviceService {
         this.chooseWaitSeconds = chooseWaitSeconds;
         this.pollIntervalSeconds = pollIntervalSeconds;
         this.maxWaitSeconds = maxWaitSeconds;
-        this.processingLeaseSeconds = processingLeaseSeconds;
+        this.stuckSeconds = stuckSeconds;
     }
 
     @Transactional
@@ -97,8 +112,9 @@ public class DeviceService {
 
         try {
             Device saved = deviceRepository
-                    .save(new Device(appReferenceId, imei, null, INITIAL_STATE, INITIAL_STATUS, LocalDateTime.now()));
-            log.info("Accepted device register command for imei {} (device {}), OGrad flow pending", imei,
+                    .save(new Device(appReferenceId, imei, null, ENROLLING, INITIAL_STATUS, LocalDateTime.now()));
+            enqueueStep(KafkaTopics.DEVICE_ENROLL, saved, null);
+            log.info("Accepted device register command for imei {} (device {}), enroll step queued", imei,
                     saved.getId());
         }
         catch (DataIntegrityViolationException e) {
@@ -114,8 +130,9 @@ public class DeviceService {
     }
 
     private void retryOrReject(String appReferenceId, Device existing, String imei) {
-        if ("failed".equals(existing.getState())) {
+        if (FAILED.equals(existing.getState())) {
             existing.resetForRetry(appReferenceId);
+            enqueueStep(KafkaTopics.DEVICE_ENROLL, existing, null);
             log.info("Retrying failed registration for imei {} (device {}) with appReferenceId {}", imei,
                     existing.getId(), appReferenceId);
             return;
@@ -125,33 +142,22 @@ public class DeviceService {
         reject(appReferenceId, existing.getId(), imei, "imei already registered");
     }
 
-    private boolean claim(Device device, String state) {
-        LocalDateTime now = LocalDateTime.now();
-        int claimed = deviceRepository.tryClaim(device.getId(), state, now.plusSeconds(processingLeaseSeconds),
-                now);
-        if (claimed == 0) {
-            log.debug("Device {} already claimed by another worker, skipping", device.getId());
-            return false;
+    public void handleEnroll(DeviceStepEvent event) {
+        Device device = loadInState(event, ENROLLING);
+        if (device == null) {
+            return;
         }
-        return true;
-    }
-
-    public void processEnrolling() {
-        List<Device> claimableDevices = deviceRepository.findClaimableByState("enrolling", LocalDateTime.now(),
-                PageRequest.of(0, BATCH_SIZE));
-        for (Device device : claimableDevices) {
-            if (!claim(device, "enrolling")) {
-                continue;
+        String failure = runValidateAndUpload(device);
+        transition(device.getId(), ENROLLING, current -> {
+            if (failure != null) {
+                failRegistration(current, failure);
+                return;
             }
-            String failure = runValidateAndUpload(device);
-            try {
-                transactionTemplate.executeWithoutResult(
-                        transactionStatus -> completeEnrollment(device.getId(), failure));
-            }
-            catch (OptimisticLockingFailureException e) {
-                log.warn("Device {} concurrently updated by another worker, skipping this round", device.getId());
-            }
-        }
+            current.markUploaded();
+            enqueueStep(KafkaTopics.DEVICE_CHOOSE, current, Instant.now().plusSeconds(chooseWaitSeconds));
+            log.info("Device {} imei {} validated and uploaded on OGrad, choose due in {}s", current.getId(),
+                    current.getImei(), chooseWaitSeconds);
+        });
     }
 
     private String runValidateAndUpload(Device device) {
@@ -167,38 +173,22 @@ public class DeviceService {
         }
     }
 
-    private void completeEnrollment(String deviceId, String failure) {
-        Device device = deviceRepository.findById(deviceId).orElse(null);
-        if (device == null || !"enrolling".equals(device.getState())) {
+    public void handleChoose(DeviceStepEvent event) {
+        Device device = loadInState(event, UPLOADED);
+        if (device == null) {
             return;
         }
-        if (failure == null) {
-            device.markUploaded(LocalDateTime.now().plusSeconds(chooseWaitSeconds));
-            log.info("Device {} imei {} validated and uploaded on OGrad, choose due in {}s", device.getId(),
-                    device.getImei(), chooseWaitSeconds);
-        }
-        else {
-            failRegistration(device, failure);
-        }
-    }
-
-    public void processUploaded() {
-        LocalDateTime now = LocalDateTime.now();
-        List<Device> uploadedDevices = deviceRepository.findClaimableForChoose("uploaded", now, now,
-                PageRequest.of(0, BATCH_SIZE));
-        for (Device device : uploadedDevices) {
-            if (!claim(device, "uploaded")) {
-                continue;
+        String failure = runChoose(device);
+        transition(device.getId(), UPLOADED, current -> {
+            if (failure != null) {
+                failRegistration(current, failure);
+                return;
             }
-            String failure = runChoose(device);
-            try {
-                transactionTemplate.executeWithoutResult(
-                        transactionStatus -> completeChoose(device.getId(), failure));
-            }
-            catch (OptimisticLockingFailureException e) {
-                log.warn("Device {} concurrently updated by another worker, skipping this round", device.getId());
-            }
-        }
+            current.markAwaitingStatus(LocalDateTime.now().plusSeconds(maxWaitSeconds));
+            enqueueStep(KafkaTopics.DEVICE_STATUS_CHECK, current, null);
+            log.info("Device {} imei {} package chosen on OGrad, polling status", current.getId(),
+                    current.getImei());
+        });
     }
 
     private String runChoose(Device device) {
@@ -213,34 +203,13 @@ public class DeviceService {
         }
     }
 
-    private void completeChoose(String deviceId, String failure) {
-        Device device = deviceRepository.findById(deviceId).orElse(null);
-        if (device == null || !"uploaded".equals(device.getState())) {
+    public void handleStatusCheck(DeviceStepEvent event) {
+        Device device = loadInState(event, ACTIVATING);
+        if (device == null) {
             return;
         }
-        if (failure == null) {
-            LocalDateTime now = LocalDateTime.now();
-            device.markAwaitingStatus(now, now.plusSeconds(maxWaitSeconds));
-            log.info("Device {} imei {} package chosen on OGrad, polling status", device.getId(), device.getImei());
-        }
-        else {
-            failRegistration(device, failure);
-        }
-    }
-
-    public void pollStatus() {
-        List<Device> due = deviceRepository
-                .findTop50ByStateAndNextStatusCheckAtLessThanEqualOrderByIdAsc("activating", LocalDateTime.now());
-        for (Device device : due) {
-            String deviceStatus = fetchStatus(device);
-            try {
-                transactionTemplate.executeWithoutResult(
-                        transactionStatus -> completeStatusPoll(device.getId(), deviceStatus));
-            }
-            catch (OptimisticLockingFailureException e) {
-                log.warn("Device {} concurrently updated by another worker, skipping this round", device.getId());
-            }
-        }
+        String deviceStatus = fetchStatus(device);
+        transition(device.getId(), ACTIVATING, current -> applyStatus(current, deviceStatus));
     }
 
     private String fetchStatus(Device device) {
@@ -254,26 +223,82 @@ public class DeviceService {
         }
     }
 
-    private void completeStatusPoll(String deviceId, String deviceStatus) {
-        Device device = deviceRepository.findById(deviceId).orElse(null);
-        if (device == null || !"activating".equals(device.getState())) {
-            return;
-        }
+    private void applyStatus(Device device, String deviceStatus) {
         if ("normal".equals(deviceStatus)) {
             device.markEnrolled(deviceStatus);
             saveResponse(device.getId(), new DeviceRegisteredResponse(device.getAppReferenceId(), device.getId(),
                     device.getImei(), device.getState(), device.getStatus(), "REGISTERED"));
             log.info("Device {} imei {} enrolled via OGrad", device.getId(), device.getImei());
+            return;
         }
-        else if (LocalDateTime.now().isAfter(device.getStatusDeadlineAt())) {
+        if (device.getStatusDeadlineAt() == null || LocalDateTime.now().isAfter(device.getStatusDeadlineAt())) {
             String lastStatus = deviceStatus != null ? deviceStatus : "unavailable";
             log.warn("OGrad status for device {} imei {} not normal within {}s (last: {})", device.getId(),
                     device.getImei(), maxWaitSeconds, lastStatus);
             failRegistration(device,
                     "OGrad status not normal within " + maxWaitSeconds + "s (last status: " + lastStatus + ")");
+            return;
         }
-        else {
-            device.rescheduleStatusCheck(LocalDateTime.now().plusSeconds(pollIntervalSeconds));
+        device.touch();
+        enqueueStep(KafkaTopics.DEVICE_STATUS_CHECK, device, Instant.now().plusSeconds(pollIntervalSeconds));
+    }
+
+    public void sweepStuckDevices() {
+        LocalDateTime cutoff = LocalDateTime.now().minusSeconds(stuckSeconds);
+        List<Device> stuck = deviceRepository.findStuck(IN_FLIGHT_STATES, cutoff,
+                PageRequest.of(0, SWEEP_BATCH_SIZE));
+        for (Device candidate : stuck) {
+            transition(candidate.getId(), candidate.getState(), current -> {
+                if (!lastChange(current).isBefore(cutoff)) {
+                    return;
+                }
+                current.touch();
+                requeueCurrentStep(current);
+            });
+        }
+    }
+
+    private void requeueCurrentStep(Device device) {
+        switch (device.getState()) {
+            case ENROLLING -> enqueueStep(KafkaTopics.DEVICE_ENROLL, device, null);
+            case UPLOADED -> enqueueStep(KafkaTopics.DEVICE_CHOOSE, device, null);
+            case ACTIVATING -> enqueueStep(KafkaTopics.DEVICE_STATUS_CHECK, device, null);
+            default -> {
+                return;
+            }
+        }
+        log.warn("Device {} imei {} stuck in state {}, re-queued its step event", device.getId(), device.getImei(),
+                device.getState());
+    }
+
+    private static LocalDateTime lastChange(Device device) {
+        return device.getUpdatedAt() != null ? device.getUpdatedAt() : device.getCreatedAt();
+    }
+
+    private Device loadInState(DeviceStepEvent event, String expectedState) {
+        Device device = deviceRepository.findById(event.deviceId()).orElse(null);
+        if (device == null || !expectedState.equals(device.getState())) {
+            log.info("Ignoring {} event for device {}: current state is {}", expectedState, event.deviceId(),
+                    device == null ? "missing" : device.getState());
+            return null;
+        }
+        return device;
+    }
+
+    private void transition(String deviceId, String expectedState, Consumer<Device> change) {
+        try {
+            transactionTemplate.executeWithoutResult(transactionStatus -> {
+                Device device = deviceRepository.findById(deviceId).orElse(null);
+                if (device == null || !expectedState.equals(device.getState())) {
+                    log.info("Device {} left state {} while the step was running, skipping", deviceId,
+                            expectedState);
+                    return;
+                }
+                change.accept(device);
+            });
+        }
+        catch (OptimisticLockingFailureException e) {
+            log.warn("Device {} concurrently updated, skipping this event", deviceId);
         }
     }
 
@@ -288,8 +313,17 @@ public class DeviceService {
                 device.getImei(), "REGISTER_FAILED", reason));
     }
 
+    private void enqueueStep(String topic, Device device, Instant dueAt) {
+        saveOutbox(topic, device.getId(),
+                new DeviceStepEvent(device.getId(), device.getImei(), device.getState(), dueAt));
+    }
+
     private void saveResponse(String deviceId, Object payload) {
+        saveOutbox(KafkaTopics.DEVICE_RESPONSES, deviceId, payload);
+    }
+
+    private void saveOutbox(String topic, String key, Object payload) {
         String message = objectMapper.writeValueAsString(payload);
-        outboxRepository.save(new OutboxMessage(KafkaTopics.DEVICE_RESPONSES, deviceId, message, Instant.now()));
+        outboxRepository.save(new OutboxMessage(topic, key, message, Instant.now()));
     }
 }

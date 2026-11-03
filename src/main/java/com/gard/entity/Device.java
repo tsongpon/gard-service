@@ -37,17 +37,8 @@ public class Device {
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
-    @Column(name = "next_status_check_at")
-    private LocalDateTime nextStatusCheckAt;
-
     @Column(name = "status_deadline_at")
     private LocalDateTime statusDeadlineAt;
-
-    @Column(name = "choose_not_before")
-    private LocalDateTime chooseNotBefore;
-
-    @Column(name = "processing_until")
-    private LocalDateTime processingUntil;
 
     @Version
     private long version;
@@ -63,25 +54,17 @@ public class Device {
         this.state = state;
         this.status = status;
         this.createdAt = createdAt;
+        this.updatedAt = createdAt;
     }
 
-    public void markUploaded(LocalDateTime chooseNotBefore) {
+    public void markUploaded() {
         this.state = "uploaded";
-        this.chooseNotBefore = chooseNotBefore;
-        this.processingUntil = null;
         this.updatedAt = LocalDateTime.now();
     }
 
-    public void markAwaitingStatus(LocalDateTime nextStatusCheckAt, LocalDateTime statusDeadlineAt) {
+    public void markAwaitingStatus(LocalDateTime statusDeadlineAt) {
         this.state = "activating";
-        this.nextStatusCheckAt = nextStatusCheckAt;
         this.statusDeadlineAt = statusDeadlineAt;
-        this.processingUntil = null;
-        this.updatedAt = LocalDateTime.now();
-    }
-
-    public void rescheduleStatusCheck(LocalDateTime nextStatusCheckAt) {
-        this.nextStatusCheckAt = nextStatusCheckAt;
         this.updatedAt = LocalDateTime.now();
     }
 
@@ -91,9 +74,12 @@ public class Device {
         this.updatedAt = LocalDateTime.now();
     }
 
+    public void touch() {
+        this.updatedAt = LocalDateTime.now();
+    }
+
     public void markFailed() {
         this.state = "failed";
-        this.processingUntil = null;
         this.updatedAt = LocalDateTime.now();
     }
 
@@ -101,10 +87,7 @@ public class Device {
         this.appReferenceId = appReferenceId;
         this.state = "enrolling";
         this.status = "pending";
-        this.chooseNotBefore = null;
-        this.nextStatusCheckAt = null;
         this.statusDeadlineAt = null;
-        this.processingUntil = null;
         this.updatedAt = LocalDateTime.now();
     }
 
@@ -140,20 +123,8 @@ public class Device {
         return updatedAt;
     }
 
-    public LocalDateTime getNextStatusCheckAt() {
-        return nextStatusCheckAt;
-    }
-
     public LocalDateTime getStatusDeadlineAt() {
         return statusDeadlineAt;
-    }
-
-    public LocalDateTime getChooseNotBefore() {
-        return chooseNotBefore;
-    }
-
-    public LocalDateTime getProcessingUntil() {
-        return processingUntil;
     }
 
     public long getVersion() {
@@ -162,9 +133,5 @@ public class Device {
 
     public void setUpdatedAt(LocalDateTime updatedAt) {
         this.updatedAt = updatedAt;
-    }
-
-    public void setProcessingUntil(LocalDateTime processingUntil) {
-        this.processingUntil = processingUntil;
     }
 }
