@@ -24,7 +24,10 @@ any OGrad step failure   ──(outbox)──► device-responses  REGISTER_FAIL
 | `<topic>-dlt` | — | events that failed 3 retries (malformed JSON goes straight here) |
 
 Step events are keyed by `deviceId`, so a device's events stay on one partition and are handled by one
-consumer at a time. All topics are declared at startup by `KafkaTopicConfig` (`device.kafka.partitions`).
+consumer at a time. Locally, the `kafka-init` service in `docker-compose.yml` creates every topic (3
+partitions, replication 1) before the app starts, and broker auto-creation is disabled. The app also
+declares the same topics through `KafkaTopicConfig` (`device.kafka.partitions`), so it works against a
+broker that was not provisioned.
 
 ## Delayed steps
 

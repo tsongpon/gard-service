@@ -36,13 +36,41 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_NUM_PARTITIONS: 3
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       CLUSTER_ID: 5L6g3nShT-eMCtU--u56SQ
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
       interval: 5s
       timeout: 10s
       retries: 12
+
+  kafka-init:
+    image: apache/kafka:4.4.0
+    container_name: gard-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVER: kafka:9092
+      PARTITIONS: 3
+      REPLICATION_FACTOR: 1
+      TOPICS: >-
+        device-commands device-commands-dlt
+        device-responses
+        device-enroll device-enroll-dlt
+        device-choose device-choose-dlt
+        device-status-check device-status-check-dlt
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        for topic in $${TOPICS}; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$${BOOTSTRAP_SERVER}" --create --if-not-exists \
+            --topic "$${topic}" --partitions "$${PARTITIONS}" --replication-factor "$${REPLICATION_FACTOR}"
+        done
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$${BOOTSTRAP_SERVER}" --describe \
+          | grep -E '^Topic:' | awk '{print $$2, "partitions=" $$6, "replication=" $$8}' | sort
+    restart: "no"
 
   redis:
     image: redis:7-alpine
@@ -61,8 +89,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     environment:
