@@ -21,6 +21,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -54,20 +55,18 @@ class OutboxServiceTest {
     }
 
     @Test
-    void sendFailureKeepsMessageAndContinuesBatch() {
+    void sendFailureStopsBatchSoLaterMessagesAreNotPublishedOutOfOrder() {
         OutboxMessage failing = new OutboxMessage("device-responses", "k1", "payload-1", Instant.now());
-        OutboxMessage healthy = new OutboxMessage("device-responses", "k2", "payload-2", Instant.now());
-        when(repository.findTop50ByOrderByIdAsc()).thenReturn(List.of(failing, healthy));
+        OutboxMessage later = new OutboxMessage("device-responses", "k1", "payload-2", Instant.now());
+        when(repository.findTop50ByOrderByIdAsc()).thenReturn(List.of(failing, later));
         CompletableFuture<SendResult<Object, Object>> failed = new CompletableFuture<>();
         failed.completeExceptionally(new ExecutionException(new IllegalStateException("broker down")));
-        when(kafkaTemplate.send(anyString(), any(), any()))
-                .thenReturn(failed)
-                .thenReturn(CompletableFuture.completedFuture(null));
+        when(kafkaTemplate.send(anyString(), any(), any())).thenReturn(failed);
 
         service.publishPendingMessages();
 
-        verify(repository, never()).delete(failing);
-        verify(repository).delete(healthy);
+        verify(kafkaTemplate, times(1)).send(anyString(), any(), any());
+        verify(repository, never()).delete(any(OutboxMessage.class));
     }
 
     @Test

@@ -1,11 +1,13 @@
 package com.gard.service;
 
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Consumer;
 
 import com.gard.dto.DeviceRegisterRequest;
+import com.gard.dto.DeviceStepEvent;
 import com.gard.entity.Device;
 import com.gard.entity.OutboxMessage;
 import com.gard.kafka.KafkaTopics;
@@ -25,16 +27,17 @@ import tools.jackson.databind.ObjectMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class DeviceServiceTest {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     private DeviceRepository deviceRepository;
 
@@ -57,13 +60,14 @@ class DeviceServiceTest {
             action.accept(null);
             return null;
         }).when(transactionTemplate).executeWithoutResult(any());
-        when(deviceRepository.tryClaim(any(), any(), any(), any())).thenReturn(1);
         service = new DeviceService(deviceRepository, oGradRepository, outboxRepository, transactionTemplate,
-                new ObjectMapper(), 1, 1, 5, 180);
+                objectMapper, 1, 1, 5, 600);
     }
 
+    // ---------------------------------------------------------------- register
+
     @Test
-    void registerSavesNewDeviceWhenImeiAndReferenceAreFresh() {
+    void registerSavesNewDeviceAndQueuesEnrollStep() {
         when(deviceRepository.findByAppReferenceId("ref-1")).thenReturn(Optional.empty());
         when(deviceRepository.findByImei("111")).thenReturn(Optional.empty());
         when(deviceRepository.save(any(Device.class))).thenAnswer(invocation -> invocation.getArgument(0));
@@ -77,12 +81,19 @@ class DeviceServiceTest {
         assertThat(saved.getImei()).isEqualTo("111");
         assertThat(saved.getState()).isEqualTo("enrolling");
         assertThat(saved.getStatus()).isEqualTo("pending");
-        verify(outboxRepository, never()).save(any(OutboxMessage.class));
+        assertThat(saved.getUpdatedAt()).isNotNull();
+
+        OutboxMessage queued = captureOutboxSave();
+        assertThat(queued.getTopic()).isEqualTo(KafkaTopics.DEVICE_ENROLL);
+        DeviceStepEvent event = readEvent(queued);
+        assertThat(event.imei()).isEqualTo("111");
+        assertThat(event.expectedState()).isEqualTo("enrolling");
+        assertThat(event.dueAt()).isNull();
     }
 
     @Test
     void registerSkipsReplayOfSameAppReferenceId() {
-        Device existing = new Device("ref-1", "111", null, "enrolled", "normal", LocalDateTime.now());
+        Device existing = device("ref-1", "111", "enrolled");
         when(deviceRepository.findByAppReferenceId("ref-1")).thenReturn(Optional.of(existing));
 
         service.register(new DeviceRegisterRequest("111", "ref-1"));
@@ -93,7 +104,7 @@ class DeviceServiceTest {
 
     @Test
     void registerRejectsCommandForAlreadyRegisteredImei() {
-        Device existing = new Device("ref-old", "111", null, "enrolled", "normal", LocalDateTime.now());
+        Device existing = device("ref-old", "111", "enrolled");
         when(deviceRepository.findByAppReferenceId("ref-new")).thenReturn(Optional.empty());
         when(deviceRepository.findByImei("111")).thenReturn(Optional.of(existing));
 
@@ -118,7 +129,7 @@ class DeviceServiceTest {
 
     @Test
     void registerTreatsConstraintRaceAsBusinessReject() {
-        Device winner = new Device("ref-winner", "111", null, "enrolling", "pending", LocalDateTime.now());
+        Device winner = device("ref-winner", "111", "enrolling");
         when(deviceRepository.findByAppReferenceId("ref-loser")).thenReturn(Optional.empty());
         when(deviceRepository.findByImei("111")).thenReturn(Optional.empty(), Optional.of(winner));
         when(deviceRepository.save(any(Device.class))).thenThrow(new DataIntegrityViolationException("duplicate"));
@@ -132,7 +143,7 @@ class DeviceServiceTest {
 
     @Test
     void registerTreatsConstraintRaceAsReplay() {
-        Device winner = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
+        Device winner = device("ref-1", "111", "enrolling");
         when(deviceRepository.findByAppReferenceId("ref-1")).thenReturn(Optional.empty());
         when(deviceRepository.findByImei("111")).thenReturn(Optional.empty(), Optional.of(winner));
         when(deviceRepository.save(any(Device.class))).thenThrow(new DataIntegrityViolationException("duplicate"));
@@ -143,26 +154,26 @@ class DeviceServiceTest {
     }
 
     @Test
-    void registerResetsFailedDeviceForRetry() {
-        Device failed = new Device("ref-old", "111", null, "failed", "pending", LocalDateTime.now());
+    void registerResetsFailedDeviceAndQueuesEnrollStep() {
+        Device failed = device("ref-old", "111", "failed");
         when(deviceRepository.findByAppReferenceId("ref-new")).thenReturn(Optional.empty());
         when(deviceRepository.findByImei("111")).thenReturn(Optional.of(failed));
 
         service.register(new DeviceRegisterRequest("111", "ref-new"));
 
         verify(deviceRepository, never()).save(any(Device.class));
-        verify(outboxRepository, never()).save(any(OutboxMessage.class));
         assertThat(failed.getState()).isEqualTo("enrolling");
         assertThat(failed.getStatus()).isEqualTo("pending");
         assertThat(failed.getAppReferenceId()).isEqualTo("ref-new");
         assertThat(failed.getChooseNotBefore()).isNull();
         assertThat(failed.getNextStatusCheckAt()).isNull();
         assertThat(failed.getStatusDeadlineAt()).isNull();
+        assertThat(captureOutboxSave().getTopic()).isEqualTo(KafkaTopics.DEVICE_ENROLL);
     }
 
     @Test
     void registerSkipsReplayOfFailedDevice() {
-        Device failed = new Device("ref-1", "111", null, "failed", "pending", LocalDateTime.now());
+        Device failed = device("ref-1", "111", "failed");
         when(deviceRepository.findByAppReferenceId("ref-1")).thenReturn(Optional.of(failed));
 
         service.register(new DeviceRegisterRequest("111", "ref-1"));
@@ -174,7 +185,7 @@ class DeviceServiceTest {
 
     @Test
     void registerTreatsConstraintRaceAsRetryOfFailed() {
-        Device winner = new Device("ref-old", "111", null, "failed", "pending", LocalDateTime.now());
+        Device winner = device("ref-old", "111", "failed");
         when(deviceRepository.findByAppReferenceId("ref-new")).thenReturn(Optional.empty());
         when(deviceRepository.findByImei("111")).thenReturn(Optional.empty(), Optional.of(winner));
         when(deviceRepository.save(any(Device.class))).thenThrow(new DataIntegrityViolationException("duplicate"));
@@ -183,153 +194,135 @@ class DeviceServiceTest {
 
         assertThat(winner.getState()).isEqualTo("enrolling");
         assertThat(winner.getAppReferenceId()).isEqualTo("ref-new");
-        verify(outboxRepository, never()).save(any(OutboxMessage.class));
+        assertThat(captureOutboxSave().getTopic()).isEqualTo(KafkaTopics.DEVICE_ENROLL);
     }
 
-    @Test
-    void oGradStepFailureMarksDeviceFailedAndWritesErrorResponse() {
-        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
-        doThrow(new IllegalStateException("connection refused")).when(oGradRepository).validateImei("111");
-
-        service.processEnrolling();
-
-        assertThat(device.getState()).isEqualTo("failed");
-        OutboxMessage saved = captureOutboxSave();
-        assertThat(saved.getTopic()).isEqualTo(KafkaTopics.DEVICE_RESPONSES);
-        assertThat(saved.getMessageKey()).isEqualTo(device.getId());
-        assertThat(saved.getPayload()).contains("REGISTER_FAILED").contains("111").contains("connection refused");
-    }
+    // ---------------------------------------------------------------- enroll step
 
     @Test
-    void successfulValidateAndUploadMarksDeviceUploaded() {
-        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+    void enrollSuccessMarksUploadedAndQueuesDelayedChoose() {
+        Device device = stored(device("ref-1", "111", "enrolling"));
 
-        service.processEnrolling();
+        service.handleEnroll(event("enrolling"));
 
         verify(oGradRepository).validateImei("111");
         verify(oGradRepository).upload("111");
         verify(oGradRepository, never()).choose("111");
         assertThat(device.getState()).isEqualTo("uploaded");
         assertThat(device.getChooseNotBefore()).isAfter(LocalDateTime.now());
-        assertThat(device.getNextStatusCheckAt()).isNull();
+
+        OutboxMessage queued = captureOutboxSave();
+        assertThat(queued.getTopic()).isEqualTo(KafkaTopics.DEVICE_CHOOSE);
+        DeviceStepEvent next = readEvent(queued);
+        assertThat(next.expectedState()).isEqualTo("uploaded");
+        assertThat(next.dueAt()).isAfter(Instant.now());
+    }
+
+    @Test
+    void enrollFailureMarksDeviceFailedAndWritesErrorResponse() {
+        Device device = stored(device("ref-1", "111", "enrolling"));
+        doThrow(new IllegalStateException("connection refused")).when(oGradRepository).validateImei("111");
+
+        service.handleEnroll(event("enrolling"));
+
+        assertThat(device.getState()).isEqualTo("failed");
+        OutboxMessage saved = captureOutboxSave();
+        assertThat(saved.getTopic()).isEqualTo(KafkaTopics.DEVICE_RESPONSES);
+        assertThat(saved.getPayload()).contains("REGISTER_FAILED").contains("111").contains("connection refused");
+    }
+
+    @Test
+    void staleEnrollEventIsIgnoredWithoutCallingOGrad() {
+        Device device = stored(device("ref-1", "111", "uploaded"));
+
+        service.handleEnroll(event("enrolling"));
+
+        verifyNoInteractions(oGradRepository);
+        assertThat(device.getState()).isEqualTo("uploaded");
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
 
     @Test
-    void processEnrollingSkipsDeviceAlreadyTransitioned() {
-        Device device = new Device("ref-1", "111", null, "activating", "pending", LocalDateTime.now());
-        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+    void enrollEventForMissingDeviceIsIgnored() {
+        when(deviceRepository.findById(any())).thenReturn(Optional.empty());
 
-        service.processEnrolling();
+        service.handleEnroll(event("enrolling"));
 
-        verify(oGradRepository).validateImei("111");
-        assertThat(device.getState()).isEqualTo("activating");
-        assertThat(device.getNextStatusCheckAt()).isNull();
+        verifyNoInteractions(oGradRepository);
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
 
     @Test
-    void optimisticLockFailureSkipsDeviceAndContinuesBatch() {
-        Device first = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        Device second = new Device("ref-2", "222", null, "enrolling", "pending", LocalDateTime.now());
-        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(first, second));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(second));
-        doAnswer(invocation -> {
-            throw new OptimisticLockingFailureException("lost race");
-        }).doAnswer(invocation -> {
-            Consumer<TransactionStatus> action = invocation.getArgument(0);
-            action.accept(null);
-            return null;
-        }).when(transactionTemplate).executeWithoutResult(any());
+    void enrollSkipsTransitionWhenStateChangedDuringOGradCall() {
+        Device before = device("ref-1", "111", "enrolling");
+        Device after = device("ref-1", "111", "failed");
+        when(deviceRepository.findById(any())).thenReturn(Optional.of(before), Optional.of(after));
 
-        service.processEnrolling();
+        service.handleEnroll(event("enrolling"));
 
-        assertThat(first.getState()).isEqualTo("enrolling");
-        assertThat(second.getState()).isEqualTo("uploaded");
+        verify(oGradRepository).upload("111");
+        assertThat(after.getState()).isEqualTo("failed");
+        verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
 
     @Test
-    void chooseStepSuccessMarksDeviceActivating() {
-        Device device = new Device("ref-1", "111", null, "uploaded", "pending", LocalDateTime.now());
-        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
-                .thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+    void optimisticLockFailureIsSwallowed() {
+        stored(device("ref-1", "111", "enrolling"));
+        doThrow(new OptimisticLockingFailureException("lost race")).when(transactionTemplate)
+                .executeWithoutResult(any());
 
-        service.processUploaded();
+        service.handleEnroll(event("enrolling"));
+
+        verify(oGradRepository).upload("111");
+    }
+
+    // ---------------------------------------------------------------- choose step
+
+    @Test
+    void chooseSuccessMarksActivatingAndQueuesStatusCheck() {
+        Device device = stored(device("ref-1", "111", "uploaded"));
+
+        service.handleChoose(event("uploaded"));
 
         verify(oGradRepository).choose("111");
         verify(oGradRepository, never()).validateImei("111");
         assertThat(device.getState()).isEqualTo("activating");
-        assertThat(device.getStatusDeadlineAt()).isNotNull();
-        verify(outboxRepository, never()).save(any(OutboxMessage.class));
+        assertThat(device.getStatusDeadlineAt()).isAfter(LocalDateTime.now());
+
+        OutboxMessage queued = captureOutboxSave();
+        assertThat(queued.getTopic()).isEqualTo(KafkaTopics.DEVICE_STATUS_CHECK);
+        assertThat(readEvent(queued).expectedState()).isEqualTo("activating");
     }
 
     @Test
-    void chooseStepFailureMarksDeviceFailedAndWritesErrorResponse() {
-        Device device = new Device("ref-1", "111", null, "uploaded", "pending", LocalDateTime.now());
-        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
-                .thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+    void chooseFailureMarksDeviceFailedAndWritesErrorResponse() {
+        Device device = stored(device("ref-1", "111", "uploaded"));
         doThrow(new IllegalStateException("connection refused")).when(oGradRepository).choose("111");
 
-        service.processUploaded();
+        service.handleChoose(event("uploaded"));
 
         assertThat(device.getState()).isEqualTo("failed");
-        OutboxMessage saved = captureOutboxSave();
-        assertThat(saved.getPayload()).contains("REGISTER_FAILED").contains("choose step failed");
+        assertThat(captureOutboxSave().getPayload()).contains("REGISTER_FAILED").contains("choose step failed");
     }
 
     @Test
-    void processUploadedSkipsDeviceAlreadyTransitioned() {
-        Device device = new Device("ref-1", "111", null, "activating", "pending", LocalDateTime.now());
-        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
-                .thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+    void staleChooseEventIsIgnoredWithoutCallingOGrad() {
+        stored(device("ref-1", "111", "activating"));
 
-        service.processUploaded();
+        service.handleChoose(event("uploaded"));
 
-        verify(oGradRepository).choose("111");
-        assertThat(device.getState()).isEqualTo("activating");
-        assertThat(device.getNextStatusCheckAt()).isNull();
+        verifyNoInteractions(oGradRepository);
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
 
-    @Test
-    void optimisticLockFailureDuringChooseSkipsDeviceAndContinuesBatch() {
-        Device first = new Device("ref-1", "111", null, "uploaded", "pending", LocalDateTime.now());
-        Device second = new Device("ref-2", "222", null, "uploaded", "pending", LocalDateTime.now());
-        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
-                .thenReturn(List.of(first, second));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(second));
-        doAnswer(invocation -> {
-            throw new OptimisticLockingFailureException("lost race");
-        }).doAnswer(invocation -> {
-            Consumer<TransactionStatus> action = invocation.getArgument(0);
-            action.accept(null);
-            return null;
-        }).when(transactionTemplate).executeWithoutResult(any());
-
-        service.processUploaded();
-
-        assertThat(first.getState()).isEqualTo("uploaded");
-        assertThat(second.getState()).isEqualTo("activating");
-    }
+    // ---------------------------------------------------------------- status step
 
     @Test
     void normalStatusEnrollsDeviceAndWritesSuccessResponse() {
-        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        device.markAwaitingStatus(LocalDateTime.now().minusSeconds(2), LocalDateTime.now().plusSeconds(5));
-        when(deviceRepository.findTop50ByStateAndNextStatusCheckAtLessThanEqualOrderByIdAsc(anyString(),
-                any(LocalDateTime.class))).thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+        Device device = stored(activating(LocalDateTime.now().plusSeconds(5)));
         when(oGradRepository.getStatus("111")).thenReturn("normal");
 
-        service.pollStatus();
+        service.handleStatusCheck(event("activating"));
 
         assertThat(device.getState()).isEqualTo("enrolled");
         assertThat(device.getStatus()).isEqualTo("normal");
@@ -340,138 +333,108 @@ class DeviceServiceTest {
     }
 
     @Test
-    void overdueDeadlineMarksDeviceFailedAndWritesErrorResponse() {
-        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        device.markAwaitingStatus(LocalDateTime.now().minusSeconds(10), LocalDateTime.now().minusSeconds(1));
-        when(deviceRepository.findTop50ByStateAndNextStatusCheckAtLessThanEqualOrderByIdAsc(anyString(),
-                any(LocalDateTime.class))).thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+    void nonNormalStatusBeforeDeadlineQueuesNextCheck() {
+        Device device = stored(activating(LocalDateTime.now().plusSeconds(3)));
         when(oGradRepository.getStatus("111")).thenReturn("configuring");
 
-        service.pollStatus();
-
-        assertThat(device.getState()).isEqualTo("failed");
-        OutboxMessage saved = captureOutboxSave();
-        assertThat(saved.getPayload()).contains("REGISTER_FAILED").contains("last status: configuring");
-    }
-
-    @Test
-    void nonNormalStatusBeforeDeadlineReschedulesCheck() {
-        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        device.markAwaitingStatus(LocalDateTime.now().minusSeconds(2), LocalDateTime.now().plusSeconds(3));
-        when(deviceRepository.findTop50ByStateAndNextStatusCheckAtLessThanEqualOrderByIdAsc(anyString(),
-                any(LocalDateTime.class))).thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
-        when(oGradRepository.getStatus("111")).thenReturn("configuring");
-
-        service.pollStatus();
+        service.handleStatusCheck(event("activating"));
 
         assertThat(device.getState()).isEqualTo("activating");
         assertThat(device.getNextStatusCheckAt()).isAfter(LocalDateTime.now());
-        verify(outboxRepository, never()).save(any(OutboxMessage.class));
+        OutboxMessage queued = captureOutboxSave();
+        assertThat(queued.getTopic()).isEqualTo(KafkaTopics.DEVICE_STATUS_CHECK);
+        assertThat(readEvent(queued).dueAt()).isAfter(Instant.now());
     }
 
     @Test
-    void getStatusFailureBeforeDeadlineReschedulesCheck() {
-        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        device.markAwaitingStatus(LocalDateTime.now().minusSeconds(2), LocalDateTime.now().plusSeconds(3));
-        when(deviceRepository.findTop50ByStateAndNextStatusCheckAtLessThanEqualOrderByIdAsc(anyString(),
-                any(LocalDateTime.class))).thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+    void getStatusFailureBeforeDeadlineQueuesNextCheck() {
+        Device device = stored(activating(LocalDateTime.now().plusSeconds(3)));
         when(oGradRepository.getStatus("111")).thenThrow(new IllegalStateException("connection refused"));
 
-        service.pollStatus();
+        service.handleStatusCheck(event("activating"));
 
         assertThat(device.getState()).isEqualTo("activating");
-        assertThat(device.getNextStatusCheckAt()).isAfter(LocalDateTime.now());
-        verify(outboxRepository, never()).save(any(OutboxMessage.class));
+        assertThat(captureOutboxSave().getTopic()).isEqualTo(KafkaTopics.DEVICE_STATUS_CHECK);
+    }
+
+    @Test
+    void overdueDeadlineMarksDeviceFailedAndWritesErrorResponse() {
+        Device device = stored(activating(LocalDateTime.now().minusSeconds(1)));
+        when(oGradRepository.getStatus("111")).thenReturn("configuring");
+
+        service.handleStatusCheck(event("activating"));
+
+        assertThat(device.getState()).isEqualTo("failed");
+        assertThat(captureOutboxSave().getPayload()).contains("REGISTER_FAILED").contains("last status: configuring");
     }
 
     @Test
     void getStatusFailureAfterDeadlineMarksDeviceFailed() {
-        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        device.markAwaitingStatus(LocalDateTime.now().minusSeconds(10), LocalDateTime.now().minusSeconds(1));
-        when(deviceRepository.findTop50ByStateAndNextStatusCheckAtLessThanEqualOrderByIdAsc(anyString(),
-                any(LocalDateTime.class))).thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
+        Device device = stored(activating(LocalDateTime.now().minusSeconds(1)));
         when(oGradRepository.getStatus("111")).thenThrow(new IllegalStateException("connection refused"));
 
-        service.pollStatus();
+        service.handleStatusCheck(event("activating"));
 
         assertThat(device.getState()).isEqualTo("failed");
-        OutboxMessage saved = captureOutboxSave();
-        assertThat(saved.getPayload()).contains("REGISTER_FAILED").contains("unavailable");
+        assertThat(captureOutboxSave().getPayload()).contains("REGISTER_FAILED").contains("unavailable");
+    }
+
+    // ---------------------------------------------------------------- sweeper
+
+    @Test
+    void sweeperRequeuesStepForEachStuckState() {
+        Device enrolling = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now().minusHours(1));
+        Device uploaded = new Device("ref-2", "222", null, "enrolling", "pending", LocalDateTime.now().minusHours(1));
+        uploaded.markUploaded(LocalDateTime.now().minusMinutes(50));
+        uploaded.setUpdatedAt(LocalDateTime.now().minusHours(1));
+        when(deviceRepository.findStuck(any(), any(), any())).thenReturn(List.of(enrolling, uploaded));
+        when(deviceRepository.findById(any())).thenReturn(Optional.of(enrolling), Optional.of(uploaded));
+
+        service.sweepStuckDevices();
+
+        ArgumentCaptor<OutboxMessage> captor = ArgumentCaptor.forClass(OutboxMessage.class);
+        verify(outboxRepository, org.mockito.Mockito.times(2)).save(captor.capture());
+        assertThat(captor.getAllValues()).extracting(OutboxMessage::getTopic)
+                .containsExactly(KafkaTopics.DEVICE_ENROLL, KafkaTopics.DEVICE_CHOOSE);
+        assertThat(enrolling.getUpdatedAt()).isAfter(LocalDateTime.now().minusMinutes(1));
+        assertThat(uploaded.getUpdatedAt()).isAfter(LocalDateTime.now().minusMinutes(1));
     }
 
     @Test
-    void unclaimedDeviceIsSkippedWithoutExternalCall() {
-        Device first = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        Device second = new Device("ref-2", "222", null, "enrolling", "pending", LocalDateTime.now());
-        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any()))
-                .thenReturn(List.of(first, second));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(second));
-        when(deviceRepository.tryClaim(any(), any(), any(), any())).thenReturn(0, 1);
+    void sweeperSkipsDeviceThatMovedSinceTheQuery() {
+        Device stale = new Device("ref-1", "111", null, "activating", "pending", LocalDateTime.now().minusHours(1));
+        Device fresh = new Device("ref-1", "111", null, "activating", "pending", LocalDateTime.now());
+        when(deviceRepository.findStuck(any(), any(), any())).thenReturn(List.of(stale));
+        when(deviceRepository.findById(any())).thenReturn(Optional.of(fresh));
 
-        service.processEnrolling();
+        service.sweepStuckDevices();
 
-        verify(oGradRepository, never()).validateImei("111");
-        verify(oGradRepository).validateImei("222");
-        assertThat(first.getState()).isEqualTo("enrolling");
-        assertThat(second.getState()).isEqualTo("uploaded");
+        verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
 
-    @Test
-    void successfulValidateAndUploadClearsProcessingLease() {
-        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        device.setProcessingUntil(LocalDateTime.now().plusMinutes(3));
-        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
+    // ---------------------------------------------------------------- helpers
+
+    private static Device device(String reference, String imei, String state) {
+        return new Device(reference, imei, null, state, "pending", LocalDateTime.now());
+    }
+
+    private static Device activating(LocalDateTime deadline) {
+        Device device = device("ref-1", "111", "enrolling");
+        device.markAwaitingStatus(LocalDateTime.now(), deadline);
+        return device;
+    }
+
+    private Device stored(Device device) {
         when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
-
-        service.processEnrolling();
-
-        assertThat(device.getState()).isEqualTo("uploaded");
-        assertThat(device.getProcessingUntil()).isNull();
+        return device;
     }
 
-    @Test
-    void oGradStepFailureClearsProcessingLease() {
-        Device device = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now());
-        device.setProcessingUntil(LocalDateTime.now().plusMinutes(3));
-        when(deviceRepository.findClaimableByState(eq("enrolling"), any(), any())).thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
-        doThrow(new IllegalStateException("connection refused")).when(oGradRepository).validateImei("111");
-
-        service.processEnrolling();
-
-        assertThat(device.getState()).isEqualTo("failed");
-        assertThat(device.getProcessingUntil()).isNull();
+    private static DeviceStepEvent event(String state) {
+        return new DeviceStepEvent("dev-1", "111", state, null);
     }
 
-    @Test
-    void chooseStepSuccessClearsProcessingLease() {
-        Device device = new Device("ref-1", "111", null, "uploaded", "pending", LocalDateTime.now());
-        device.setProcessingUntil(LocalDateTime.now().plusMinutes(3));
-        when(deviceRepository.findClaimableForChoose(anyString(), any(LocalDateTime.class), any(), any()))
-                .thenReturn(List.of(device));
-        when(deviceRepository.findById(any())).thenReturn(Optional.of(device));
-
-        service.processUploaded();
-
-        assertThat(device.getState()).isEqualTo("activating");
-        assertThat(device.getProcessingUntil()).isNull();
-    }
-
-    @Test
-    void registerRetryClearsStaleLeaseOnFailedDevice() {
-        Device failed = new Device("ref-old", "111", null, "failed", "pending", LocalDateTime.now());
-        failed.setProcessingUntil(LocalDateTime.now().plusMinutes(3));
-        when(deviceRepository.findByAppReferenceId("ref-new")).thenReturn(Optional.empty());
-        when(deviceRepository.findByImei("111")).thenReturn(Optional.of(failed));
-
-        service.register(new DeviceRegisterRequest("111", "ref-new"));
-
-        assertThat(failed.getState()).isEqualTo("enrolling");
-        assertThat(failed.getProcessingUntil()).isNull();
+    private DeviceStepEvent readEvent(OutboxMessage message) {
+        return objectMapper.readValue(message.getPayload(), DeviceStepEvent.class);
     }
 
     private OutboxMessage captureOutboxSave() {

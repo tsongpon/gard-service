@@ -46,9 +46,6 @@ public class Device {
     @Column(name = "choose_not_before")
     private LocalDateTime chooseNotBefore;
 
-    @Column(name = "processing_until")
-    private LocalDateTime processingUntil;
-
     @Version
     private long version;
 
@@ -63,12 +60,12 @@ public class Device {
         this.state = state;
         this.status = status;
         this.createdAt = createdAt;
+        this.updatedAt = createdAt;
     }
 
     public void markUploaded(LocalDateTime chooseNotBefore) {
         this.state = "uploaded";
         this.chooseNotBefore = chooseNotBefore;
-        this.processingUntil = null;
         this.updatedAt = LocalDateTime.now();
     }
 
@@ -76,7 +73,6 @@ public class Device {
         this.state = "activating";
         this.nextStatusCheckAt = nextStatusCheckAt;
         this.statusDeadlineAt = statusDeadlineAt;
-        this.processingUntil = null;
         this.updatedAt = LocalDateTime.now();
     }
 
@@ -91,9 +87,13 @@ public class Device {
         this.updatedAt = LocalDateTime.now();
     }
 
+    /** Bumps updatedAt (and the version) so the sweeper does not pick the device again right away. */
+    public void touch() {
+        this.updatedAt = LocalDateTime.now();
+    }
+
     public void markFailed() {
         this.state = "failed";
-        this.processingUntil = null;
         this.updatedAt = LocalDateTime.now();
     }
 
@@ -104,7 +104,6 @@ public class Device {
         this.chooseNotBefore = null;
         this.nextStatusCheckAt = null;
         this.statusDeadlineAt = null;
-        this.processingUntil = null;
         this.updatedAt = LocalDateTime.now();
     }
 
@@ -152,19 +151,11 @@ public class Device {
         return chooseNotBefore;
     }
 
-    public LocalDateTime getProcessingUntil() {
-        return processingUntil;
-    }
-
     public long getVersion() {
         return version;
     }
 
     public void setUpdatedAt(LocalDateTime updatedAt) {
         this.updatedAt = updatedAt;
-    }
-
-    public void setProcessingUntil(LocalDateTime processingUntil) {
-        this.processingUntil = processingUntil;
     }
 }
