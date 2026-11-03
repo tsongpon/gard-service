@@ -26,11 +26,13 @@ import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.ObjectMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -163,8 +165,6 @@ class DeviceServiceTest {
         assertThat(failed.getState()).isEqualTo("enrolling");
         assertThat(failed.getStatus()).isEqualTo("pending");
         assertThat(failed.getAppReferenceId()).isEqualTo("ref-new");
-        assertThat(failed.getChooseNotBefore()).isNull();
-        assertThat(failed.getNextStatusCheckAt()).isNull();
         assertThat(failed.getStatusDeadlineAt()).isNull();
         assertThat(captureOutboxSave().getTopic()).isEqualTo(KafkaTopics.DEVICE_ENROLL);
     }
@@ -205,7 +205,6 @@ class DeviceServiceTest {
         verify(oGradRepository).upload("111");
         verify(oGradRepository, never()).choose("111");
         assertThat(device.getState()).isEqualTo("uploaded");
-        assertThat(device.getChooseNotBefore()).isAfter(LocalDateTime.now());
 
         OutboxMessage queued = captureOutboxSave();
         assertThat(queued.getTopic()).isEqualTo(KafkaTopics.DEVICE_CHOOSE);
@@ -286,6 +285,7 @@ class DeviceServiceTest {
         OutboxMessage queued = captureOutboxSave();
         assertThat(queued.getTopic()).isEqualTo(KafkaTopics.DEVICE_STATUS_CHECK);
         assertThat(readEvent(queued).expectedState()).isEqualTo("activating");
+        assertThat(readEvent(queued).dueAt()).isNull();
     }
 
     @Test
@@ -327,12 +327,13 @@ class DeviceServiceTest {
     @Test
     void nonNormalStatusBeforeDeadlineQueuesNextCheck() {
         Device device = stored(activating(LocalDateTime.now().plusSeconds(3)));
+        device.setUpdatedAt(LocalDateTime.now().minusMinutes(1));
         when(oGradRepository.getStatus("111")).thenReturn("configuring");
 
         service.handleStatusCheck(event("activating"));
 
         assertThat(device.getState()).isEqualTo("activating");
-        assertThat(device.getNextStatusCheckAt()).isAfter(LocalDateTime.now());
+        assertThat(device.getUpdatedAt()).isAfter(LocalDateTime.now().minusSeconds(5));
         OutboxMessage queued = captureOutboxSave();
         assertThat(queued.getTopic()).isEqualTo(KafkaTopics.DEVICE_STATUS_CHECK);
         assertThat(readEvent(queued).dueAt()).isAfter(Instant.now());
@@ -375,7 +376,7 @@ class DeviceServiceTest {
     void sweeperRequeuesStepForEachStuckState() {
         Device enrolling = new Device("ref-1", "111", null, "enrolling", "pending", LocalDateTime.now().minusHours(1));
         Device uploaded = new Device("ref-2", "222", null, "enrolling", "pending", LocalDateTime.now().minusHours(1));
-        uploaded.markUploaded(LocalDateTime.now().minusMinutes(50));
+        uploaded.markUploaded();
         uploaded.setUpdatedAt(LocalDateTime.now().minusHours(1));
         when(deviceRepository.findStuck(any(), any(), any())).thenReturn(List.of(enrolling, uploaded));
         when(deviceRepository.findById(any())).thenReturn(Optional.of(enrolling), Optional.of(uploaded));
@@ -383,9 +384,10 @@ class DeviceServiceTest {
         service.sweepStuckDevices();
 
         ArgumentCaptor<OutboxMessage> captor = ArgumentCaptor.forClass(OutboxMessage.class);
-        verify(outboxRepository, org.mockito.Mockito.times(2)).save(captor.capture());
+        verify(outboxRepository, times(2)).save(captor.capture());
         assertThat(captor.getAllValues()).extracting(OutboxMessage::getTopic)
                 .containsExactly(KafkaTopics.DEVICE_ENROLL, KafkaTopics.DEVICE_CHOOSE);
+        assertThat(captor.getAllValues()).extracting(message -> readEvent(message).dueAt()).containsOnlyNulls();
         assertThat(enrolling.getUpdatedAt()).isAfter(LocalDateTime.now().minusMinutes(1));
         assertThat(uploaded.getUpdatedAt()).isAfter(LocalDateTime.now().minusMinutes(1));
     }
@@ -402,13 +404,21 @@ class DeviceServiceTest {
         verify(outboxRepository, never()).save(any(OutboxMessage.class));
     }
 
+    @Test
+    void sweeperThresholdMustExceedChooseWaitAndPollInterval() {
+        assertThatThrownBy(() -> new DeviceService(deviceRepository, oGradRepository, outboxRepository,
+                transactionTemplate, objectMapper, 60, 10, 300, 60))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("device.sweeper.stuck-seconds");
+    }
+
     private static Device device(String reference, String imei, String state) {
         return new Device(reference, imei, null, state, "pending", LocalDateTime.now());
     }
 
     private static Device activating(LocalDateTime deadline) {
         Device device = device("ref-1", "111", "enrolling");
-        device.markAwaitingStatus(LocalDateTime.now(), deadline);
+        device.markAwaitingStatus(deadline);
         return device;
     }
 

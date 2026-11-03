@@ -46,8 +46,8 @@ sequenceDiagram
             alt state changed while OGrad call was running
                 Note over DeviceService: skip, another event already advanced the device
             else choose succeeded
-                Note right of DeviceService: markAwaitingStatus: state = 'activating',<br/>nextStatusCheckAt = now, statusDeadlineAt = now + 300s
-                DeviceService->>OutboxRepository: save DeviceStepEvent(deviceId, imei, 'activating', dueAt = now)
+                Note right of DeviceService: markAwaitingStatus: state = 'activating',<br/>statusDeadlineAt = now + 300s
+                DeviceService->>OutboxRepository: save DeviceStepEvent(deviceId, imei, 'activating', dueAt = null)
                 OutboxRepository->>MariaDB: INSERT INTO outbox_messages (topic = device-status-check)
                 MariaDB-->>OutboxRepository: ok
                 OutboxRepository-->>DeviceService: ok

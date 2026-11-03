@@ -19,7 +19,7 @@ any OGrad step failure   ──(outbox)──► device-responses  REGISTER_FAIL
 | Topic | Consumer group | Payload |
 |---|---|---|
 | `device-enroll` | `gard-service-enroll` | `DeviceStepEvent{deviceId, imei, expectedState, dueAt}` |
-| `device-choose` | `gard-service-choose` | same, `dueAt` = chooseNotBefore |
+| `device-choose` | `gard-service-choose` | same, `dueAt` = upload time + 60s |
 | `device-status-check` | `gard-service-status-check` | same, `dueAt` = next check |
 | `<topic>-dlt` | — | events that failed 3 retries (malformed JSON goes straight here) |
 
@@ -44,7 +44,9 @@ never delays or rebalances another.
   and again inside the transaction; `@Version` rejects concurrent updates.
 - **Stuck-device sweeper** (`DeviceSweeperSchedule`, every `device.sweeper.interval-ms`, ShedLock
   `device-stuck-sweeper`): devices in `enrolling` / `uploaded` / `activating` unchanged for
-  `device.sweeper.stuck-seconds` get their current step event re-queued. This recovers events that went to a
+  `device.sweeper.stuck-seconds` get their current step event re-queued with no delay (`dueAt = null`).
+  The app refuses to start unless `stuck-seconds` is greater than both the choose wait and the status poll
+  interval, so a re-queued choose can never run before its wait has passed. This recovers events that went to a
   DLT, and devices left in flight by the earlier scheduler-based version.
 - OGrad `upload` / `choose` can run twice if the process dies after the call but before the commit, so they
   must be idempotent on the OGrad side.

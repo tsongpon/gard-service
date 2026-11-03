@@ -37,14 +37,8 @@ public class Device {
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
-    @Column(name = "next_status_check_at")
-    private LocalDateTime nextStatusCheckAt;
-
     @Column(name = "status_deadline_at")
     private LocalDateTime statusDeadlineAt;
-
-    @Column(name = "choose_not_before")
-    private LocalDateTime chooseNotBefore;
 
     @Version
     private long version;
@@ -63,21 +57,14 @@ public class Device {
         this.updatedAt = createdAt;
     }
 
-    public void markUploaded(LocalDateTime chooseNotBefore) {
+    public void markUploaded() {
         this.state = "uploaded";
-        this.chooseNotBefore = chooseNotBefore;
         this.updatedAt = LocalDateTime.now();
     }
 
-    public void markAwaitingStatus(LocalDateTime nextStatusCheckAt, LocalDateTime statusDeadlineAt) {
+    public void markAwaitingStatus(LocalDateTime statusDeadlineAt) {
         this.state = "activating";
-        this.nextStatusCheckAt = nextStatusCheckAt;
         this.statusDeadlineAt = statusDeadlineAt;
-        this.updatedAt = LocalDateTime.now();
-    }
-
-    public void rescheduleStatusCheck(LocalDateTime nextStatusCheckAt) {
-        this.nextStatusCheckAt = nextStatusCheckAt;
         this.updatedAt = LocalDateTime.now();
     }
 
@@ -100,8 +87,6 @@ public class Device {
         this.appReferenceId = appReferenceId;
         this.state = "enrolling";
         this.status = "pending";
-        this.chooseNotBefore = null;
-        this.nextStatusCheckAt = null;
         this.statusDeadlineAt = null;
         this.updatedAt = LocalDateTime.now();
     }
@@ -138,16 +123,8 @@ public class Device {
         return updatedAt;
     }
 
-    public LocalDateTime getNextStatusCheckAt() {
-        return nextStatusCheckAt;
-    }
-
     public LocalDateTime getStatusDeadlineAt() {
         return statusDeadlineAt;
-    }
-
-    public LocalDateTime getChooseNotBefore() {
-        return chooseNotBefore;
     }
 
     public long getVersion() {

@@ -62,12 +62,12 @@ sequenceDiagram
                 DeviceService->>MariaDB: UPDATE devices SET state = 'failed', ... WHERE id AND version (flush at commit)
                 MariaDB-->>DeviceService: ok
             else status != 'normal' and now <= statusDeadlineAt
-                Note right of DeviceService: rescheduleStatusCheck: nextStatusCheckAt = now + 10s,<br/>state stays 'activating'
+                Note right of DeviceService: touch: updatedAt = now,<br/>state stays 'activating'
                 DeviceService->>OutboxRepository: save DeviceStepEvent(deviceId, imei, 'activating', dueAt = now + 10s)
                 OutboxRepository->>MariaDB: INSERT INTO outbox_messages (topic = device-status-check)
                 MariaDB-->>OutboxRepository: ok
                 OutboxRepository-->>DeviceService: ok
-                DeviceService->>MariaDB: UPDATE devices SET next_status_check_at = now + 10s WHERE id AND version (flush at commit)
+                DeviceService->>MariaDB: UPDATE devices SET updated_at = now WHERE id AND version (flush at commit)
                 MariaDB-->>DeviceService: ok
             end
         end

@@ -2,7 +2,6 @@ package com.gard.service;
 
 import java.time.Instant;
 import java.time.LocalDateTime;
-import java.time.ZoneId;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -67,6 +66,11 @@ public class DeviceService {
             @Value("${ograd.status.poll-interval-seconds:10}") long pollIntervalSeconds,
             @Value("${ograd.status.max-wait-seconds:300}") long maxWaitSeconds,
             @Value("${device.sweeper.stuck-seconds:600}") long stuckSeconds) {
+        if (stuckSeconds <= Math.max(chooseWaitSeconds, pollIntervalSeconds)) {
+            throw new IllegalStateException("device.sweeper.stuck-seconds (" + stuckSeconds
+                    + ") must be greater than ograd.choose.wait-seconds (" + chooseWaitSeconds
+                    + ") and ograd.status.poll-interval-seconds (" + pollIntervalSeconds + ")");
+        }
         this.deviceRepository = deviceRepository;
         this.oGradRepository = oGradRepository;
         this.outboxRepository = outboxRepository;
@@ -149,9 +153,8 @@ public class DeviceService {
                 failRegistration(current, failure);
                 return;
             }
-            LocalDateTime chooseAt = LocalDateTime.now().plusSeconds(chooseWaitSeconds);
-            current.markUploaded(chooseAt);
-            enqueueStep(KafkaTopics.DEVICE_CHOOSE, current, toInstant(chooseAt));
+            current.markUploaded();
+            enqueueStep(KafkaTopics.DEVICE_CHOOSE, current, Instant.now().plusSeconds(chooseWaitSeconds));
             log.info("Device {} imei {} validated and uploaded on OGrad, choose due in {}s", current.getId(),
                     current.getImei(), chooseWaitSeconds);
         });
@@ -181,9 +184,8 @@ public class DeviceService {
                 failRegistration(current, failure);
                 return;
             }
-            LocalDateTime now = LocalDateTime.now();
-            current.markAwaitingStatus(now, now.plusSeconds(maxWaitSeconds));
-            enqueueStep(KafkaTopics.DEVICE_STATUS_CHECK, current, toInstant(now));
+            current.markAwaitingStatus(LocalDateTime.now().plusSeconds(maxWaitSeconds));
+            enqueueStep(KafkaTopics.DEVICE_STATUS_CHECK, current, null);
             log.info("Device {} imei {} package chosen on OGrad, polling status", current.getId(),
                     current.getImei());
         });
@@ -229,8 +231,7 @@ public class DeviceService {
             log.info("Device {} imei {} enrolled via OGrad", device.getId(), device.getImei());
             return;
         }
-        LocalDateTime now = LocalDateTime.now();
-        if (device.getStatusDeadlineAt() == null || now.isAfter(device.getStatusDeadlineAt())) {
+        if (device.getStatusDeadlineAt() == null || LocalDateTime.now().isAfter(device.getStatusDeadlineAt())) {
             String lastStatus = deviceStatus != null ? deviceStatus : "unavailable";
             log.warn("OGrad status for device {} imei {} not normal within {}s (last: {})", device.getId(),
                     device.getImei(), maxWaitSeconds, lastStatus);
@@ -238,9 +239,8 @@ public class DeviceService {
                     "OGrad status not normal within " + maxWaitSeconds + "s (last status: " + lastStatus + ")");
             return;
         }
-        LocalDateTime nextCheck = now.plusSeconds(pollIntervalSeconds);
-        device.rescheduleStatusCheck(nextCheck);
-        enqueueStep(KafkaTopics.DEVICE_STATUS_CHECK, device, toInstant(nextCheck));
+        device.touch();
+        enqueueStep(KafkaTopics.DEVICE_STATUS_CHECK, device, Instant.now().plusSeconds(pollIntervalSeconds));
     }
 
     public void sweepStuckDevices() {
@@ -261,8 +261,7 @@ public class DeviceService {
     private void requeueCurrentStep(Device device) {
         switch (device.getState()) {
             case ENROLLING -> enqueueStep(KafkaTopics.DEVICE_ENROLL, device, null);
-            case UPLOADED -> enqueueStep(KafkaTopics.DEVICE_CHOOSE, device,
-                    device.getChooseNotBefore() != null ? toInstant(device.getChooseNotBefore()) : null);
+            case UPLOADED -> enqueueStep(KafkaTopics.DEVICE_CHOOSE, device, null);
             case ACTIVATING -> enqueueStep(KafkaTopics.DEVICE_STATUS_CHECK, device, null);
             default -> {
                 return;
@@ -326,9 +325,5 @@ public class DeviceService {
     private void saveOutbox(String topic, String key, Object payload) {
         String message = objectMapper.writeValueAsString(payload);
         outboxRepository.save(new OutboxMessage(topic, key, message, Instant.now()));
-    }
-
-    private static Instant toInstant(LocalDateTime time) {
-        return time.atZone(ZoneId.systemDefault()).toInstant();
     }
 }
