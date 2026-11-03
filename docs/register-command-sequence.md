@@ -1,33 +1,49 @@
 # Register Command Consumer — consumeRegisterDeviceCommand
 
 Sequence diagram (happy path) for consuming a register command from Kafka
-`device-commands`: the consumer parses the message and `DeviceService.register()`
-saves a new `enrolling` device and queues its first step event (see kafka-workflow.md).
+`device-commands`: the consumer parses the message, `DeviceService.register()` saves a new
+`enrolling` device and writes its first step event (`device-enroll`) to the outbox in the same
+transaction. The outbox publisher then sends it to Kafka (see `outbox-publish-sequence.md`).
 
 ```mermaid
 sequenceDiagram
-    participant K as Kafka (device-commands)
-    participant C as DeviceCommandConsumer
-    participant S as DeviceService (register transaction)
-    participant R as DeviceRepository
-    participant DB as MariaDB
-    participant P as OutboxService
+    participant Kafka as Kafka (device-commands)
+    participant DeviceCommandConsumer
+    participant DeviceService
+    participant DeviceRepository
+    participant MariaDB
+    participant OutboxRepository
 
-    K->>C: consumeRegisterDeviceCommand(message)
-    Note right of C: @KafkaListener group gard-service,<br/>manual ack (ack-mode manual_immediate)
-    C->>C: parse JSON to DeviceRegisterRequest(imei, appReferenceId)
-    C->>S: register(request) - @Transactional
-    S->>R: findByAppReferenceId (replay check)
-    R->>DB: SELECT devices WHERE app_reference_id = ?
-    DB-->>R: none
-    S->>R: findByImei (duplicate check)
-    R->>DB: SELECT devices WHERE imei = ?
-    DB-->>R: none
-    S->>R: save new Device (persist only, UUID assigned, no SQL yet)
-    S->>S: write DeviceStepEvent to outbox (device-enroll)
-    S-->>C: return, transaction commits
-    Note over S,DB: INSERT devices (state = 'enrolling') and INSERT outbox_messages<br/>run in the same transaction and become visible together at commit
-    C->>K: acknowledge() - offset committed after success
-    P->>K: publish device-enroll event (outbox poll, every 1s)
-    Note over P: enroll consumer continues the flow (see kafka-workflow.md);<br/>a response reaches device-responses once the device is enrolled or failed
+    Kafka->>DeviceCommandConsumer: consumeRegisterDeviceCommand(message)
+    Note right of DeviceCommandConsumer: @KafkaListener group gard-service,<br/>manual ack (ack-mode manual_immediate)
+    DeviceCommandConsumer->>DeviceCommandConsumer: parse JSON to DeviceRegisterRequest(imei, appReferenceId)
+    DeviceCommandConsumer->>DeviceService: register(request)
+    Note right of DeviceService: @Transactional
+
+    DeviceService->>DeviceRepository: find by appReferenceId (replay check)
+    DeviceRepository->>MariaDB: SELECT devices WHERE app_reference_id = ?
+    MariaDB-->>DeviceRepository: none
+    DeviceRepository-->>DeviceService: empty
+
+    DeviceService->>DeviceRepository: find by imei (duplicate check)
+    DeviceRepository->>MariaDB: SELECT devices WHERE imei = ?
+    MariaDB-->>DeviceRepository: none
+    DeviceRepository-->>DeviceService: empty
+
+    DeviceService->>DeviceRepository: save new device
+    Note right of DeviceRepository: persist only, UUID id assigned,<br/>state = 'enrolling', status = 'pending'
+    DeviceRepository-->>DeviceService: saved device
+
+    DeviceService->>OutboxRepository: save DeviceStepEvent(deviceId, imei, 'enrolling', dueAt = null)
+    OutboxRepository->>MariaDB: INSERT INTO outbox_messages (topic = device-enroll, key = deviceId)
+    MariaDB-->>OutboxRepository: ok
+    OutboxRepository-->>DeviceService: ok
+
+    DeviceService->>MariaDB: COMMIT
+    Note right of MariaDB: INSERT INTO devices flushed at commit,<br/>device row and outbox row become visible together
+    MariaDB-->>DeviceService: ok
+    DeviceService-->>DeviceCommandConsumer: ok
+
+    DeviceCommandConsumer->>Kafka: acknowledge()
+    Note right of Kafka: offset committed only after the transaction succeeded
 ```

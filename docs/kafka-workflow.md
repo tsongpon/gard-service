@@ -46,40 +46,13 @@ never delays or rebalances another.
 - OGrad `upload` / `choose` can run twice if the process dies after the call but before the commit, so they
   must be idempotent on the OGrad side.
 
-## Step sequence (choose shown; enroll and status check follow the same shape)
+## Sequence diagrams
 
-```mermaid
-sequenceDiagram
-    participant K as Kafka (device-choose)
-    participant C as DeviceStepConsumer.onChoose
-    participant S as DeviceService.handleChoose
-    participant DB as MariaDB
-    participant O as OGrad API
-    participant P as OutboxService
-
-    K->>C: DeviceStepEvent(deviceId, dueAt)
-    alt now < dueAt
-        C->>K: nack(min(dueAt - now, 30s)), partition paused, record redelivered later
-    else due
-        C->>S: handleChoose(event)
-        S->>DB: SELECT device by id
-        alt state != 'uploaded'
-            Note over S: stale/duplicate event, skip without calling OGrad
-        else state = 'uploaded'
-            S->>O: choose(imei) (retried up to 3x)
-            O-->>S: ok / error
-            S->>DB: BEGIN, re-read device, verify state = 'uploaded'
-            alt choose ok
-                S->>DB: UPDATE devices SET state = 'activating', deadline = now + 300s
-                S->>DB: INSERT outbox (device-status-check, dueAt = now)
-            else choose failed
-                S->>DB: UPDATE devices SET state = 'failed'
-                S->>DB: INSERT outbox (device-responses, REGISTER_FAILED)
-            end
-            S->>DB: COMMIT
-        end
-        C->>K: acknowledge()
-    end
-    P->>DB: SELECT pending outbox rows (every 1s)
-    P->>K: publish next step event / response, then DELETE row
-```
+| Flow | Diagram |
+|---|---|
+| Register command (`device-commands`) | [register-command-sequence.md](register-command-sequence.md) |
+| Enroll step (`device-enroll`) | [enroll-step-sequence.md](enroll-step-sequence.md) |
+| Choose step (`device-choose`) | [choose-step-sequence.md](choose-step-sequence.md) |
+| Status check step (`device-status-check`) | [status-check-step-sequence.md](status-check-step-sequence.md) |
+| Outbox publisher | [outbox-publish-sequence.md](outbox-publish-sequence.md) |
+| Stuck device sweeper | [stuck-sweeper-sequence.md](stuck-sweeper-sequence.md) |
